@@ -1,0 +1,631 @@
+import type { BBox, CapturedNode, DomCapture } from "./types";
+import { scrollState } from "./scroller";
+
+/**
+ * Attributes worth keeping. These are the ones that say what a field is *for*
+ * — which is the cheapest and most reliable PII signal on the page, far better
+ * than pattern-matching whatever the user has typed so far.
+ */
+const KEPT_ATTRS = [
+  "type",
+  "name",
+  "id",
+  "autocomplete",
+  "inputmode",
+  "placeholder",
+  "pattern",
+  "maxlength",
+  "alt",
+  "title",
+  "aria-label",
+  "data-testid",
+  // Microdata names the entity outright - the most reliable name signal a page
+  // can give, and free to read.
+  "itemprop",
+  "itemtype",
+  "rel",
+  "datetime",
+  // Identity annotations that real applications put on the elements showing a
+  // person. Gmail, Outlook, Slack, LinkedIn and Jira all do some version of
+  // this, and it is by far the most reliable name signal such a page offers -
+  // far better than trying to infer a name from a list of subject lines.
+  //
+  // Capturing these puts real addresses into the tree, so they are scanned and
+  // tokenized like any other text. Reading them without that would be adding a
+  // leak while closing one.
+  "email",
+  "data-email",
+  "data-hovercard-id",
+  "data-name",
+  "data-user-name",
+  "data-sender",
+  // State a page uses to say "this is on top of everything else". The render
+  // budget gives an open dialog priority over the page behind it, and read
+  // those attributes off the captured node - so not capturing them made that
+  // whole branch dead code, and Gmail's compose window kept losing its place
+  // to the two thousand inbox rows in front of it.
+  "aria-modal",
+  "aria-expanded",
+  "aria-haspopup",
+  "aria-hidden",
+  "open",
+  // The state of a control, which the planner cannot see any other way. Without
+  // these, a ticked checkbox, the selected tab and a pressed Bold button all
+  // rendered exactly like their opposites, so "make sure X is ticked" was a
+  // coin toss and a click meant to set a toggle could just as easily clear it.
+  "aria-checked",
+  "aria-selected",
+  "aria-pressed",
+  "aria-disabled",
+  "aria-readonly",
+  "aria-required",
+  "aria-invalid",
+];
+
+const MEDIA_TAGS = new Set(["img", "canvas", "svg", "video", "picture", "object", "embed"]);
+
+/**
+ * Regions rendered by something we cannot read. A cross-origin iframe paints
+ * into the screenshot but contributes nothing to our DOM tree, so PII inside
+ * one is invisible to every text detector while still being fully visible in
+ * the pixels. They are captured here so the pixel tier can decide what to do.
+ */
+const OPAQUE_TAGS = new Set(["iframe", "frame", "object", "embed"]);
+
+const INTERACTIVE_TAGS = new Set([
+  "a",
+  "button",
+  "input",
+  "select",
+  "textarea",
+  "summary",
+  "label",
+  "form",
+]);
+
+const LANDMARK_ROLES = new Set([
+  "main",
+  "navigation",
+  "banner",
+  "contentinfo",
+  "form",
+  "search",
+  "dialog",
+  "table",
+  "list",
+]);
+
+const SKIP_TAGS = new Set(["script", "style", "noscript", "template", "head", "meta", "link"]);
+
+let examined = 0;
+let pruned = 0;
+
+/**
+ * Live elements from the last capture, indexed by the node id in the tree.
+ *
+ * Detection runs elsewhere and comes back asking "where on screen is the text
+ * at characters 12-34 of node 87?". Answering that needs the real element, so
+ * the capture keeps a registry alongside the serialisable tree.
+ */
+let registry: Element[] = [];
+
+/** Elements collected during a walk, paired with their node before ids exist. */
+let pending = new WeakMap<CapturedNode, Element>();
+
+function collapse(value: string | null | undefined, limit = 300): string {
+  if (!value) return "";
+  const text = value.replace(/\s+/g, " ").trim();
+  return text.length > limit ? `${text.slice(0, limit)}…` : text;
+}
+
+function roleOf(el: Element): string {
+  const explicit = el.getAttribute("role");
+  if (explicit) return explicit;
+
+  const tag = el.tagName.toLowerCase();
+  if (tag === "a") return el.hasAttribute("href") ? "link" : "generic";
+  if (tag === "button" || tag === "summary") return "button";
+  if (tag === "select") return "select";
+  if (tag === "textarea") return "textbox";
+  if (tag === "img") return "image";
+  if (tag === "form") return "form";
+  if (tag === "iframe" || tag === "frame") return "frame";
+  if (tag === "address") return "address";
+  if (tag === "table") return "table";
+  if (tag === "main") return "main";
+  if (tag === "nav") return "navigation";
+  if (tag === "header") return "banner";
+  if (tag === "footer") return "contentinfo";
+  if (/^h[1-6]$/.test(tag)) return "heading";
+  if (tag === "input") {
+    const type = (el as HTMLInputElement).type;
+    if (type === "password") return "password";
+    if (type === "checkbox" || type === "radio" || type === "submit") return type;
+    if (type === "file") return "file";
+    return "textbox";
+  }
+  if (el.hasAttribute("contenteditable")) return "textbox";
+  return tag;
+}
+
+/**
+ * A label's own words, without the control it wraps.
+ *
+ * `textContent` of <label>State <select>...</select></label> is "State" and
+ * then the name of every option, run together - and for a wrapped textarea it
+ * is the field's contents. The control's subtree is not part of its name.
+ */
+function labelText(label: HTMLLabelElement, control: Element): string {
+  let out = "";
+  const walker = document.createTreeWalker(label, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const parent = node.parentElement;
+    if (parent && (parent === control || control.contains(parent) ||
+        parent.closest("select, textarea, option, datalist, script, style"))) continue;
+    out += ` ${node.textContent ?? ""}`;
+  }
+  return out;
+}
+
+function labelOf(el: Element): string {
+  const labelledBy = el.getAttribute("aria-labelledby");
+  if (labelledBy) {
+    const joined = labelledBy
+      .split(/\s+/)
+      .map((id) => document.getElementById(id)?.textContent ?? "")
+      .join(" ");
+    if (collapse(joined)) return collapse(joined, 120);
+  }
+
+  const ariaLabel = collapse(el.getAttribute("aria-label"), 120);
+  if (ariaLabel) return ariaLabel;
+
+  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) {
+    // <select> was left out, so every dropdown labelled the ordinary way -
+    // <label>State <select>...</select></label> - rendered with no name at all.
+    const labels = Array.from(el.labels ?? []);
+    const text = collapse(labels.map((label) => labelText(label, el)).join(" "), 120);
+    if (text) return text;
+    const placeholder = collapse(el.getAttribute("placeholder"), 120);
+    if (placeholder) return placeholder;
+  }
+
+  if (el instanceof HTMLImageElement) {
+    const alt = collapse(el.alt, 120);
+    if (alt) return alt;
+  }
+
+  return collapse(el.getAttribute("title"), 120);
+}
+
+/**
+ * Text belonging to this element directly, excluding descendants' text.
+ *
+ * The result is whitespace-collapsed and truncated, which means a character
+ * offset into it does *not* line up with any offset in the DOM. `ownTextMap`
+ * builds the translation, and both must stay in step - so they share one walk.
+ */
+function ownText(el: Element): string {
+  return ownTextMap(el).text;
+}
+
+/** One collapsed character, and where in the DOM it came from. */
+interface CharSource {
+  node: Text;
+  offset: number;
+}
+
+/**
+ * Builds this element's own text together with a per-character index back into
+ * the DOM, so a span found in the collapsed string can be turned into a Range
+ * and measured on screen.
+ */
+function ownTextMap(el: Element): { text: string; sources: CharSource[] } {
+  let raw = "";
+  const rawSources: CharSource[] = [];
+
+  for (const node of Array.from(el.childNodes)) {
+    if (node.nodeType !== Node.TEXT_NODE) continue;
+    const text = node.textContent ?? "";
+    for (let i = 0; i < text.length; i++) {
+      raw += text[i];
+      rawSources.push({ node: node as Text, offset: i });
+    }
+  }
+
+  // Mirror collapse(): runs of whitespace become one space, then trim.
+  let collapsed = "";
+  const sources: CharSource[] = [];
+  let inSpace = false;
+
+  for (let i = 0; i < raw.length; i++) {
+    const isSpace = /\s/.test(raw[i]);
+    if (isSpace) {
+      if (inSpace || collapsed.length === 0) continue;
+      inSpace = true;
+      collapsed += " ";
+      sources.push(rawSources[i]);
+      continue;
+    }
+    inSpace = false;
+    collapsed += raw[i];
+    sources.push(rawSources[i]);
+  }
+
+  // Trailing space from the trim.
+  while (collapsed.endsWith(" ")) {
+    collapsed = collapsed.slice(0, -1);
+    sources.pop();
+  }
+
+  if (collapsed.length > 600) {
+    collapsed = collapsed.slice(0, 600) + "\u2026";
+    sources.length = 600;
+  }
+
+  return { text: collapsed, sources };
+}
+
+function valueOf(el: Element): string | undefined {
+  if (el instanceof HTMLInputElement) {
+    // A password's contents are never captured, not even to be tokenized —
+    // the fact that the field exists is the finding.
+    if (el.type === "password") return undefined;
+    // A checkbox's state is recorded in attrs, where "unchecked" can be said
+    // too - as a value, an unticked box was indistinguishable from one whose
+    // state had not been captured at all.
+    if (el.type === "checkbox" || el.type === "radio") return undefined;
+    return collapse(el.value, 300) || undefined;
+  }
+  if (el instanceof HTMLTextAreaElement) return collapse(el.value, 600) || undefined;
+  if (el instanceof HTMLSelectElement) {
+    return collapse(el.selectedOptions[0]?.textContent ?? el.value, 120) || undefined;
+  }
+  if (el.hasAttribute("contenteditable")) {
+    return collapse((el as HTMLElement).innerText, 600) || undefined;
+  }
+  return undefined;
+}
+
+function attrsOf(el: Element): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  for (const name of KEPT_ATTRS) {
+    const value = el.getAttribute(name);
+    if (value) attrs[name] = collapse(value, 120);
+  }
+
+  if (el instanceof HTMLImageElement && el.currentSrc) {
+    try {
+      const url = new URL(el.currentSrc, location.href);
+      // Host and extension only — image URLs frequently embed user ids.
+      attrs.srcHost = url.protocol === "data:" ? "data:" : url.host;
+    } catch {
+      /* malformed src is not worth reporting */
+    }
+    attrs.naturalSize = `${el.naturalWidth}x${el.naturalHeight}`;
+  }
+
+  if (el instanceof HTMLAnchorElement && el.href) {
+    try {
+      attrs.hrefHost = new URL(el.href).host;
+    } catch {
+      /* javascript: and mailto: hrefs have no host */
+    }
+  }
+
+  if (el instanceof HTMLIFrameElement) {
+    try {
+      const url = new URL(el.src || "about:blank", location.href);
+      attrs.frameHost = url.host || url.protocol;
+      // Same-origin frames could in principle be walked; cross-origin ones
+      // never can. Recording which is which keeps the pixel tier honest.
+      attrs.crossOrigin = String(url.origin !== location.origin && url.protocol !== "about:");
+    } catch {
+      attrs.frameHost = "unknown";
+      attrs.crossOrigin = "true";
+    }
+  }
+
+  // For fields whose contents we refuse to read, record only whether anything
+  // is in them. One bit, no secret: enough for the planner to know the field is
+  // already filled, and not enough to be worth stealing. The length is
+  // deliberately not recorded - a password's length is itself a hint.
+  if (el instanceof HTMLInputElement && el.type === "password") {
+    attrs.filled = String(el.value.length > 0);
+  }
+
+  if (el === focused) attrs.focused = "true";
+  if (el instanceof HTMLInputElement && (el.type === "checkbox" || el.type === "radio")) {
+    attrs.checked = el.indeterminate ? "mixed" : String(el.checked);
+  }
+  // `matches(":disabled")` rather than the property: a control inside a
+  // disabled <fieldset> is disabled without its own flag being set.
+  if ((el as HTMLElement & { disabled?: boolean }).disabled || el.matches(":disabled")) {
+    attrs.disabled = "true";
+  }
+  if ((el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) && el.readOnly) {
+    attrs.readonly = "true";
+  }
+  if ((el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ||
+       el instanceof HTMLSelectElement) && el.required) {
+    attrs.required = "true";
+  }
+
+  return attrs;
+}
+
+function boxOf(el: Element): BBox {
+  const rect = el.getBoundingClientRect();
+  return [
+    Math.round(rect.left * 10) / 10,
+    Math.round(rect.top * 10) / 10,
+    Math.round(rect.width * 10) / 10,
+    Math.round(rect.height * 10) / 10,
+  ];
+}
+
+/**
+ * Can anything inside this element be on the screen?
+ *
+ * Only `display:none` answers no for a whole subtree. A zero-sized box does
+ * not: an element with no width or height of its own can hold children that
+ * are absolutely or fixed positioned, and those children are painted normally.
+ * Application shells lean on exactly that - a 0x0 anchor holding a popup, a
+ * menu, a compose window - so treating an empty box as an empty subtree threw
+ * away the part of the page the user had just opened.
+ *
+ * That was the Gmail compose bug: clicking Compose worked, the window opened,
+ * and the capture contained none of it, because a wrapper on the way down
+ * measured 0x0. The planner saw no compose window, concluded its click had not
+ * landed, and clicked again - opening a second one.
+ *
+ * `visibility:hidden` is deliberately not treated as fatal either: a descendant
+ * can set `visibility:visible` and become painted again.
+ */
+function hidesSubtree(style: CSSStyleDeclaration): boolean {
+  return style.display === "none";
+}
+
+/** Is this element itself painted - as opposed to merely containing things? */
+function isPainted(el: Element, style: CSSStyleDeclaration): boolean {
+  if (style.visibility === "hidden") return false;
+  const rect = el.getBoundingClientRect();
+  return rect.width > 0 || rect.height > 0;
+}
+
+/**
+ * Is this node worth a place in the tree on its own merits? Layout wrappers are
+ * not — they get pruned and their children hoisted, which is what keeps the
+ * tree small enough to reason about.
+ */
+function isSignificant(el: Element, node: CapturedNode): boolean {
+  const tag = node.tag;
+  if (INTERACTIVE_TAGS.has(tag)) return true;
+  if (MEDIA_TAGS.has(tag)) return true;
+  if (OPAQUE_TAGS.has(tag)) return true;
+  if (tag === "address") return true;
+  if (LANDMARK_ROLES.has(node.role)) return true;
+  if (node.role === "heading") return true;
+  if (node.text) return true;
+  if (node.value) return true;
+  if (el.hasAttribute("contenteditable")) return true;
+  // A box painting an image is an image, whatever its tag.
+  if (node.attrs.bgHost) return true;
+  return false;
+}
+
+function walk(el: Element): CapturedNode[] {
+  if (SKIP_TAGS.has(el.tagName.toLowerCase())) return [];
+  examined++;
+
+  const style = getComputedStyle(el);
+  if (hidesSubtree(style)) {
+    pruned++;
+    return [];
+  }
+
+  const children: CapturedNode[] = [];
+  for (const child of Array.from(el.children)) {
+    children.push(...walk(child));
+  }
+
+  // The element has no box of its own. Anything it holds has already been
+  // collected above, so hoist that and drop the empty wrapper - but never the
+  // wrapper's contents.
+  if (!isPainted(el, style)) {
+    pruned++;
+    return children;
+  }
+
+  const bbox = boxOf(el);
+  const attrs = attrsOf(el);
+
+  // A photograph does not have to be an <img>. X, LinkedIn, Slack and most chat
+  // and social UIs paint the profile picture as a CSS background on a <div>,
+  // which no image detector that walks tags will ever see. Record the host the
+  // same way srcHost is recorded, so the pixel tier can treat it as an image.
+  // Only worth doing for a box big enough to be a face, not an icon.
+  if (bbox[2] >= 24 && bbox[3] >= 24) {
+    const background = style.backgroundImage;
+    if (background && background !== "none") {
+      const url = /url\(["']?([^"')]+)["']?\)/.exec(background)?.[1];
+      if (url) {
+        try {
+          const parsed = new URL(url, location.href);
+          attrs.bgHost = parsed.protocol === "data:" ? "data:" : parsed.host;
+        } catch {
+          /* a malformed url is not worth reporting */
+        }
+      }
+    }
+  }
+
+  const node: CapturedNode = {
+    id: 0,
+    tag: el.tagName.toLowerCase(),
+    role: roleOf(el),
+    label: labelOf(el),
+    text: ownText(el) || undefined,
+    value: valueOf(el),
+    attrs,
+    bbox,
+    visible: bbox[1] < innerHeight && bbox[1] + bbox[3] > 0 && bbox[2] > 0 && bbox[3] > 0,
+    children,
+  };
+
+  // Keep a node if it earns its place, or if it is a branch point that gives
+  // the tree its shape. Otherwise hoist its children into the parent.
+  if (isSignificant(el, node) || children.length > 1) {
+    node.children = children;
+    pending.set(node, el);
+    return [node];
+  }
+
+  pruned++;
+  return children;
+}
+
+/** Depth-first id assignment, so ids read in document order. */
+function assignIds(node: CapturedNode, next: { value: number }): number {
+  node.id = next.value++;
+  const el = pending.get(node);
+  if (el) registry[node.id] = el;
+  let count = 1;
+  for (const child of node.children) count += assignIds(child, next);
+  return count;
+}
+
+/**
+ * The tree from the last capture.
+ *
+ * Anything that needs to search the page must use this rather than capturing
+ * again: a fresh capture reassigns every id, so ids reported from it would not
+ * be the ids the planner was issued, and acting on one would be refused.
+ */
+let lastTree: DomCapture | undefined;
+
+/** Bumped by every capture; see DomCapture.generation. */
+let generation = 0;
+
+/** The generation whose registry is live right now. */
+export function liveGeneration(): number {
+  return generation;
+}
+
+/** The most recent capture, for searching without reassigning ids. */
+export function lastCapture(): DomCapture | undefined {
+  return lastTree;
+}
+
+/**
+ * The live element behind a captured node, if it is still on the page.
+ *
+ * Pass the generation the id came from. When it is not the live one, the id
+ * was issued against a registry that has since been rebuilt - and resolving it
+ * anyway is how "Archive" became "Delete forever" when a toast dismissed itself
+ * between two captures. Nothing is returned rather than the wrong thing.
+ */
+export function capturedElement(id: number, from?: number): Element | undefined {
+  if (from !== undefined && from !== generation) return undefined;
+  const el = registry[id];
+  return el?.isConnected ? el : undefined;
+}
+
+export { ownTextMap };
+
+/** Builds the structured page capture. Pure read — touches nothing. */
+/**
+ * The element keyboard input goes to, looking through shadow roots.
+ *
+ * Recorded so that a key press can be judged: Enter in a search box and Enter
+ * on a focused "Send" button are the same tool call and very different acts.
+ */
+let focused: Element | null = null;
+
+function deepActiveElement(): Element | null {
+  let active = document.activeElement;
+  while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+  return active === document.body || active === document.documentElement ? null : active;
+}
+
+export function captureDom(): DomCapture {
+  examined = 0;
+  pruned = 0;
+  registry = [];
+  generation++;
+  pending = new WeakMap();
+  focused = deepActiveElement();
+
+  const children = walk(document.body);
+
+  // Where the page actually scrolls, which is usually not the window.
+  const content = scrollState();
+
+  const root: CapturedNode = {
+    id: 0,
+    tag: "body",
+    role: "document",
+    label: document.title,
+    attrs: {},
+    bbox: [0, 0, innerWidth, document.body.scrollHeight],
+    visible: true,
+    children,
+  };
+
+  const kept = assignIds(root, { value: 0 });
+
+  const capture: DomCapture = {
+    generation,
+    url: location.href,
+    origin: location.origin,
+    title: document.title,
+    capturedAt: Date.now(),
+    viewport: {
+      width: innerWidth,
+      height: innerHeight,
+      dpr: devicePixelRatio,
+      // Window scroll: this is the frame the screenshot and every redaction
+      // box are expressed in, so it stays the window's even when the window
+      // is not what moves.
+      scrollX: Math.round(scrollX),
+      scrollY: Math.round(scrollY),
+      pageHeight: Math.max(
+        document.scrollingElement?.scrollHeight ?? 0,
+        document.body.scrollHeight,
+        innerHeight,
+      ),
+      ...(content.inner
+        ? { contentScrollY: content.scrollY, contentHeight: content.pageHeight }
+        : {}),
+    },
+    root,
+    stats: { examined, kept, pruned },
+  };
+
+  lastTree = capture;
+  return capture;
+}
+
+/** Finds a node by id in a captured tree. */
+export function findNode(root: CapturedNode, id: number): CapturedNode | undefined {
+  for (const node of walkCapture(root)) {
+    if (node.id === id) return node;
+  }
+  return undefined;
+}
+
+/** All visible text in a captured tree, for scanning rather than rendering. */
+export function allText(root: CapturedNode): string {
+  const parts: string[] = [];
+  for (const node of walkCapture(root)) {
+    if (node.text) parts.push(node.text);
+    if (node.value) parts.push(node.value);
+  }
+  return parts.join("\n");
+}
+
+/** Depth-first iteration over a captured tree. */
+export function* walkCapture(node: CapturedNode): Generator<CapturedNode> {
+  yield node;
+  for (const child of node.children) yield* walkCapture(child);
+}
