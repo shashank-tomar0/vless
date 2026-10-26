@@ -1,0 +1,325 @@
+import type { ProviderId, ReasoningEffort } from "../background/providers/types";
+import type { DomCapture } from "../capture/types";
+import type { MintRequest } from "../vault/protocol";
+import type { SpanRectRequest, SpanRectResult } from "../capture/spans";
+
+/**
+ * Wire types shared by the side panel, the service worker, and the content
+ * script. The three run in separate JS realms and only ever exchange these.
+ */
+
+/** One interactive or informative node the agent is allowed to reference. */
+export interface PageElement {
+  /** Stable-within-a-snapshot handle. The model only ever sees this. */
+  id: number;
+  /** ARIA role, or a normalised fallback derived from the tag name. */
+  role: string;
+  /** Accessible name: aria-label, associated <label>, placeholder, or text. */
+  name: string;
+  /** Current value for form controls, truncated. */
+  value?: string;
+  /** Extra hints the planner needs: checked, disabled, expanded, href host. */
+  attrs?: Record<string, string>;
+}
+
+/** What the agent knows about the page at one point in time. */
+export interface PageSnapshot {
+  url: string;
+  title: string;
+  /** Interactive elements plus enough text nodes to give the page meaning. */
+  elements: PageElement[];
+  /** Visible text of the main content region, truncated. */
+  text: string;
+  /** True when the snapshot was cut off by the element budget. */
+  truncated: boolean;
+  /** Scroll position as a 0-1 fraction, so the model can tell it can scroll. */
+  scroll: { y: number; maxY: number };
+}
+
+export type ActionName =
+  | "ask_user"
+  | "click"
+  | "type"
+  | "select"
+  | "scroll"
+  | "navigate"
+  | "go_back"
+  | "key"
+  | "wait"
+  | "read_page"
+  | "find_text"
+  | "open_tab"
+  | "switch_tab"
+  | "close_tab"
+  | "list_tabs";
+
+/** A single action the planner asked for, already schema-validated. */
+export interface AgentAction {
+  name: ActionName;
+  input: Record<string, unknown>;
+}
+
+/** Result of executing one action, fed back to the planner as a tool result. */
+export interface ActionResult {
+  ok: boolean;
+  /**
+   * What happened, for the model.
+   *
+   * Precise and technical on purpose: element ids, roles, tag names. The
+   * planner acts on ids, so a result that hides them is a result it cannot use.
+   */
+  detail: string;
+  /**
+   * The same thing, for the person watching.
+   *
+   * `detail` reads like a debugger because the model needs it to. A viewer
+   * needs a sentence: "Clicked the Compose button", not
+   * `Clicked <div "Compose">.` The side panel prefers this and falls back to
+   * `detail` where an action has nothing simpler to say.
+   *
+   * This never reaches the model, and `detail` never reaches the panel - the
+   * same split the transcript already makes between real values and tokens.
+   */
+  summary?: string;
+  /** For a "profile" request: what kind of page this is. */
+  profile?: import("../content/profile").PageProfile;
+  /**
+   * A fresh view of the page, populated when the action may have changed it.
+   *
+   * There is one page representation and one id space. The agent used to have
+   * a second, flatter one of its own, which meant the ids the planner was
+   * shown and the ids actions resolved against came from different registries -
+   * fine until the planner started seeing the sanitized tree, at which point
+   * every click would have landed on the wrong element.
+   */
+  capture?: DomCapture;
+  /** Populated by the fullpage-* requests. */
+  page?: {
+    scrollX: number;
+    scrollY: number;
+    pageWidth: number;
+    pageHeight: number;
+    viewportWidth: number;
+    viewportHeight: number;
+    dpr: number;
+    /** Elements hidden for the capture, so the caller knows it happened. */
+    stickyHidden: number;
+  };
+  /** Populated only for a "span-rects" request. */
+  rects?: SpanRectResult[];
+}
+
+/** Messages the content script accepts. */
+export type ContentRequest =
+  /**
+   * `generation` is the capture the action's element ids were read from. The
+   * page refuses the action if its registry has been rebuilt since.
+   */
+  | { kind: "act"; action: AgentAction; generation?: number }
+  | { kind: "capture" }
+  /** Wait for the DOM to stop changing, so a fresh page is measured once it has settled. */
+  | { kind: "settle" }
+  /** Prepare the page for a full-page capture; returns its dimensions. */
+  | { kind: "fullpage-begin" }
+  /** Scroll to a document offset and report where we actually landed. */
+  | { kind: "fullpage-scroll"; y: number; hideSticky: boolean }
+  /** Undo everything fullpage-begin changed. */
+  | { kind: "fullpage-end" }
+  /** Where on screen are these character spans? */
+  | { kind: "span-rects"; requests: SpanRectRequest[] }
+  /** What kind of page this is - facts, not content - for the panel's suggestions. */
+  | { kind: "profile" }
+  | { kind: "ping" };
+
+/** A rendered entry in the side panel transcript. */
+export interface TranscriptEntry {
+  id: string;
+  role: "user" | "assistant" | "step" | "error" | "system";
+  text: string;
+  /** Set on "step" entries so the UI can show an icon per action type. */
+  action?: ActionName;
+  /** Set while a step is still running. */
+  pending?: boolean;
+  /**
+   * What a system line is about, so the panel can keep it quiet: "info" (the
+   * model in use, the user's usual site), "privacy" (what was protected
+   * before sending), "warning" (a protection that could not be applied).
+   */
+  tone?: "info" | "privacy" | "warning";
+}
+
+/** Service worker -> side panel events. */
+export type AgentEvent =
+  | { kind: "entry"; entry: TranscriptEntry }
+  | {
+      kind: "patch";
+      id: string;
+      text?: string;
+      pending?: boolean;
+      /** Replace the entry's text rather than appending to it. */
+      replace?: boolean;
+    }
+  | { kind: "status"; running: boolean }
+  | {
+      kind: "confirm";
+      id: string;
+      summary: string;
+    }
+  /** The agent needs something only the user knows before it can go on. */
+  | {
+      kind: "question";
+      id: string;
+      question: string;
+    };
+
+/** Side panel -> service worker commands. */
+export type PanelCommand =
+  | { kind: "run"; task: string; tabId: number }
+  | { kind: "stop" }
+  | { kind: "reset" }
+  | { kind: "confirm-reply"; id: string; approved: boolean }
+  | { kind: "question-reply"; id: string; answer: string }
+  | { kind: "get-state" }
+  /** Tasks that fit the active tab, worked out locally. */
+  | { kind: "suggestions"; tabId?: number }
+  /** Capture + PII scan of a tab. Standalone — does not involve the planner. */
+  | { kind: "inspect"; tabId?: number; fullPage?: boolean }
+  /** Mint every token one sanitization pass needs, in one round trip. */
+  | { kind: "vault-mint"; requests: MintRequest[] }
+  /** Content-free listing of what the vault holds. */
+  | { kind: "vault-view" }
+  /** Drop every mapping. Tokens already issued become unresolvable. */
+  | { kind: "vault-clear" }
+  /** Swap tokens back for real values, reporting any the vault never issued. */
+  | { kind: "vault-resolve"; text: string }
+  /** Ask a tab where a batch of tokenized spans is painted. */
+  | { kind: "span-rects"; tabId: number; requests: SpanRectRequest[] }
+  /** Everything sent to a model so far, exactly as it was sent. */
+  | { kind: "wire-log" }
+  | { kind: "wire-clear" };
+
+export interface Settings {
+  provider: ProviderId;
+  /** Keys are kept per provider so switching does not lose the others. */
+  apiKeys: Record<ProviderId, string>;
+  /** Chosen model per provider, likewise remembered independently. */
+  models: Record<ProviderId, string>;
+  /**
+   * Where the "custom" provider sends its requests.
+   *
+   * Any server speaking OpenAI's chat-completions API: a gateway, a
+   * self-hosted model, or Ollama / LM Studio on localhost. Include the version
+   * path the server expects - usually ".../v1" - because that is part of the
+   * base URL, not something we can guess.
+   */
+  customBaseUrl: string;
+  /** Hard ceiling on planner turns, so a confused agent cannot spin forever. */
+  maxSteps: number;
+  /**
+   * How much reasoning the planner buys before each action.
+   *
+   * "off" is the original behaviour: the model answers straight away. The
+   * other two let it work out its approach first, which is what keeps it from
+   * repeating an action without ever asking why the last one did nothing.
+   * Costs reasoning tokens and adds a second or two per step.
+   */
+  reasoningEffort: ReasoningEffort;
+  /**
+   * Read text out of the screenshot's pixels before it is sent.
+   *
+   *   "images" - every image-shaped region: pictures, canvases, background
+   *              images. The text the DOM cannot see is in these.
+   *   "full"   - the whole screenshot as well. Slower; catches text rendered
+   *              in ways no detector anticipated.
+   *
+   * There is no "off". A screenshot whose pictures were never read carries
+   * whatever they show - a card number in a banner reached the model that way
+   * - so reading them is part of sending one. To skip OCR, stop sending
+   * screenshots.
+   */
+  ocrMode: "images" | "full";
+  /** Ask before click/type on anything that looks irreversible. */
+  confirmRisky: boolean;
+  /**
+   * Send the redacted screenshot to the planner alongside the tokenized tree.
+   *
+   * Faces are destroyed and tokenized text is painted over with the same token
+   * the tree uses, so the picture cannot contradict the text. Costs image
+   * tokens on every turn.
+   */
+  sendScreenshot: boolean;
+  /**
+   * Capture the whole scrollable page rather than the viewport.
+   *
+   * More complete, but scrolls the tab and costs about half a second per
+   * screen. Off by default in the agent loop, where it runs every step.
+   */
+  fullPageCapture: boolean;
+  /** Offer tasks that fit the page that is open, worked out in this browser. */
+  suggestForPage: boolean;
+  /**
+   * Remember which sites the user uses for flights, food, shopping and so on,
+   * and tell the agent to go there. Kept in this browser only.
+   */
+  rememberSites: boolean;
+  /**
+   * Also learn preferred sites from the user's own visits - only to a fixed
+   * list of known booking, shopping, mail and media sites, never anything else.
+   */
+  learnFromBrowsing: boolean;
+}
+
+export const DEFAULT_SETTINGS: Settings = {
+  provider: "anthropic",
+  apiKeys: { anthropic: "", openai: "", openrouter: "", custom: "" },
+  models: {
+    anthropic: "claude-opus-5",
+    openai: "gpt-5",
+    openrouter: "anthropic/claude-opus-5",
+    custom: "",
+  },
+  customBaseUrl: "",
+  maxSteps: 40,
+  reasoningEffort: "standard",
+  // The whole screenshot: text in closed shadow roots, CSS-generated content,
+  // SVG and video frames is in no image region and no tree node, and only a
+  // full read covers it.
+  ocrMode: "full",
+  confirmRisky: true,
+  sendScreenshot: true,
+  fullPageCapture: false,
+  suggestForPage: true,
+  rememberSites: true,
+  learnFromBrowsing: true,
+};
+
+/** The shape stored before multi-provider support landed. */
+interface LegacySettings {
+  apiKey?: string;
+  model?: string;
+}
+
+/**
+ * Reads settings out of storage, upgrading anything written by an older
+ * version so an existing install keeps its key instead of silently losing it.
+ */
+export function normaliseSettings(stored: unknown): Settings {
+  const raw = (stored ?? {}) as Partial<Settings> & LegacySettings;
+
+  const settings: Settings = {
+    ...DEFAULT_SETTINGS,
+    ...raw,
+    apiKeys: { ...DEFAULT_SETTINGS.apiKeys, ...(raw.apiKeys ?? {}) },
+    models: { ...DEFAULT_SETTINGS.models, ...(raw.models ?? {}) },
+  };
+
+  // OCR can no longer be switched off while screenshots are sent; an install
+  // that had it off reads the whole screenshot from now on.
+  if (settings.ocrMode !== "images" && settings.ocrMode !== "full") settings.ocrMode = "full";
+
+  // Pre-multi-provider installs stored a bare Anthropic key and model.
+  if (raw.apiKey && !settings.apiKeys.anthropic) settings.apiKeys.anthropic = raw.apiKey;
+  if (raw.model && !raw.models) settings.models.anthropic = raw.model;
+
+  return settings;
+}
