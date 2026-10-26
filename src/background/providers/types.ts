@@ -1,0 +1,127 @@
+/**
+ * A provider-neutral view of one planning turn.
+ *
+ * Anthropic returns content blocks; OpenAI returns a message with a separate
+ * tool_calls array. Rather than teach the agent loop both shapes, each adapter
+ * normalises into the types below and the loop only ever sees these.
+ */
+
+/**
+ * "custom" is any OpenAI-compatible server the user points us at: a gateway,
+ * a self-hosted model, Ollama or LM Studio on localhost. Its base URL comes
+ * from settings rather than a table, which is the whole point of it.
+ */
+export type ProviderId = "anthropic" | "openai" | "openrouter" | "custom";
+
+/** A tool definition, in the intersection both APIs accept. */
+export interface ToolSpec {
+  name: string;
+  description: string;
+  /** JSON Schema for the arguments object. */
+  parameters: Record<string, unknown>;
+}
+
+export interface ToolCall {
+  /** Provider-issued id; results must be returned against it. */
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+export interface ToolOutcome {
+  id: string;
+  content: string;
+  isError?: boolean;
+}
+
+/** The conversation, in the one shape both adapters can translate from. */
+export type ConvMessage =
+  | { role: "user"; content: string }
+  | {
+      role: "assistant";
+      text: string;
+      toolCalls: ToolCall[];
+      /**
+       * The provider's own reasoning blocks from this turn, kept verbatim.
+       *
+       * Anthropic requires every thinking block to be handed back unmodified
+       * on the next request in a tool-use exchange - the signature is what
+       * proves the reasoning was not tampered with, and a turn that drops them
+       * is rejected. They are opaque to us: never read, edit, log or show
+       * them, only carry them.
+       */
+      reasoning?: unknown[];
+    }
+  | { role: "tool"; results: ToolOutcome[] };
+
+/**
+ * How hard the planner should think before acting.
+ *
+ * "off" is the old behaviour. The other two buy reasoning tokens: the model
+ * works out its approach before committing to a tool call, which is what stops
+ * it from clicking the same button four times while never asking itself why
+ * the first three did nothing.
+ */
+export type ReasoningEffort = "off" | "standard" | "deep";
+
+/** Anthropic's thinking budget, in tokens, per effort level. */
+export const THINKING_BUDGET: Record<ReasoningEffort, number> = {
+  off: 0,
+  standard: 4000,
+  deep: 10000,
+};
+
+export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "refusal";
+
+export interface PlannerTurn {
+  text: string;
+  toolCalls: ToolCall[];
+  /** Opaque reasoning blocks to replay on the next request. */
+  reasoning?: unknown[];
+  stopReason: StopReason;
+  /** Set when the provider declined outright. */
+  refusal?: string;
+}
+
+export interface PlannerRequest {
+  system: string;
+  messages: ConvMessage[];
+  tools: ToolSpec[];
+  signal: AbortSignal;
+  /** Called with each prose delta so the panel can stream. */
+  onText: (delta: string) => void;
+  /**
+   * A PNG data URL attached to the newest user turn.
+   *
+   * This is always the *redacted* screenshot: faces destroyed, tokenized text
+   * painted over with the same token the tree carries. Sending the raw one
+   * would undo the tokenizing, since the picture would simply hand the values
+   * back - so nothing in this codebase passes an unsanitized image here.
+   */
+  image?: string;
+  /** How much reasoning to buy before acting. Defaults to "standard". */
+  effort?: ReasoningEffort;
+}
+
+export interface Planner {
+  readonly label: string;
+  run(request: PlannerRequest): Promise<PlannerTurn>;
+}
+
+/** Raised with a message already fit to show the user. */
+export class PlannerError extends Error {}
+
+/**
+ * Tool arguments arrive as a JSON string from OpenAI and as a parsed object
+ * from Anthropic, and models occasionally emit malformed JSON either way.
+ */
+export function parseArguments(raw: unknown): Record<string, unknown> {
+  if (raw && typeof raw === "object") return raw as Record<string, unknown>;
+  if (typeof raw !== "string" || raw.trim() === "") return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}

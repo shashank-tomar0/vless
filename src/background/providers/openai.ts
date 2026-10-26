@@ -1,0 +1,288 @@
+import OpenAI from "openai";
+import type {
+  ConvMessage,
+  Planner,
+  PlannerRequest,
+  PlannerTurn,
+  ProviderId,
+  StopReason,
+  ToolSpec,
+} from "./types";
+import { PlannerError, parseArguments } from "./types";
+
+type ChatMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
+
+/**
+ * OpenAI keeps assistant prose and tool calls on one message, and expects each
+ * tool result as its own `role: "tool"` message — so one canonical tool turn
+ * fans out into several messages here.
+ */
+export function toMessages(system: string, messages: ConvMessage[]): ChatMessage[] {
+  const out: ChatMessage[] = [{ role: "system", content: system }];
+
+  for (const message of messages) {
+    if (message.role === "user") {
+      out.push({ role: "user", content: message.content });
+      continue;
+    }
+
+    if (message.role === "assistant") {
+      out.push({
+        role: "assistant",
+        content: message.text || null,
+        ...(message.toolCalls.length > 0
+          ? {
+              tool_calls: message.toolCalls.map((call) => ({
+                id: call.id,
+                type: "function" as const,
+                function: { name: call.name, arguments: JSON.stringify(call.input) },
+              })),
+            }
+          : {}),
+      });
+      continue;
+    }
+
+    for (const result of message.results) {
+      out.push({
+        role: "tool",
+        tool_call_id: result.id,
+        // There is no is_error flag here, so the marker goes inline.
+        content: result.isError ? `ERROR: ${result.content}` : result.content,
+      });
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Does this model take `reasoning_effort`?
+ *
+ * The o-series and GPT-5 do; the chat models reject the parameter outright.
+ * OpenRouter ids carry a vendor prefix, so match on the tail.
+ */
+function reasoningModel(model: string): boolean {
+  const name = model.includes("/") ? model.slice(model.lastIndexOf("/") + 1) : model;
+  return /^(o\d|gpt-5)/.test(name);
+}
+
+function toTools(tools: ToolSpec[]): OpenAI.Chat.Completions.ChatCompletionTool[] {
+  return tools.map((tool) => ({
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+    },
+  }));
+}
+
+function toStopReason(raw: string | null | undefined, hasToolCalls: boolean): StopReason {
+  if (raw === "tool_calls" || hasToolCalls) return "tool_use";
+  if (raw === "length") return "max_tokens";
+  if (raw === "content_filter") return "refusal";
+  return "end_turn";
+}
+
+const ENDPOINTS: Record<Exclude<ProviderId, "anthropic" | "custom">, string> = {
+  openai: "https://api.openai.com/v1",
+  openrouter: "https://openrouter.ai/api/v1",
+};
+
+/** The bit of a base URL worth showing in the wire log and in errors. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Serves both OpenAI and OpenRouter — OpenRouter exposes the same chat
+ * completions surface, so only the base URL and a couple of headers differ.
+ */
+export function createOpenAIPlanner(
+  provider: Exclude<ProviderId, "anthropic">,
+  apiKey: string,
+  model: string,
+  /** Required for "custom"; ignored for the two providers with fixed endpoints. */
+  baseUrl?: string,
+): Planner {
+  const endpoint = provider === "custom" ? (baseUrl ?? "") : ENDPOINTS[provider];
+
+  const client = new OpenAI({
+    // A local server - Ollama, LM Studio, vLLM - usually wants no key at all,
+    // but the SDK refuses to construct without one. The placeholder is sent
+    // and ignored; a server that does check will reject it, which is correct.
+    apiKey: apiKey || "not-required",
+    baseURL: endpoint,
+    dangerouslyAllowBrowser: true,
+    defaultHeaders:
+      provider === "openrouter"
+        ? // OpenRouter attributes traffic with these; both are optional.
+          { "HTTP-Referer": "https://github.com/vless/vless-agent", "X-Title": "VLESS Agent" }
+        : undefined,
+  });
+
+  const label =
+    provider === "openai" ? "OpenAI"
+    : provider === "openrouter" ? "OpenRouter"
+    // Name the host, not "custom": the wire log's job is to say where the
+    // bytes went, and "Custom gpt-4o" would not answer that.
+    : hostOf(endpoint);
+
+  return {
+    label: `${label} ${model}`,
+
+    async run({ system, messages, tools, signal, onText, image, effort = "standard" }: PlannerRequest): Promise<PlannerTurn> {
+      let stream: Awaited<ReturnType<typeof client.chat.completions.create>>;
+
+      const built = toMessages(system, messages);
+
+      // Attach the screenshot to the newest user turn.
+      if (image) {
+        const last = built[built.length - 1];
+        if (last?.role === "user") {
+          const text = typeof last.content === "string" ? last.content : "";
+          built[built.length - 1] = {
+            role: "user",
+            content: [
+              { type: "image_url", image_url: { url: image } },
+              { type: "text", text },
+            ],
+          };
+        }
+      }
+
+      try {
+        stream = await client.chat.completions.create(
+          {
+            model,
+            messages: built,
+            tools: toTools(tools),
+            stream: true,
+            // OpenAI renamed this for reasoning models; OpenRouter takes the
+            // original name and passes it through to whichever model is behind it.
+            ...(provider === "openai"
+              ? { max_completion_tokens: 8000 }
+              : { max_tokens: 8000 }),
+            // Reasoning effort only exists on the reasoning models. Sending it
+            // to a chat model is a 400, so it is gated on the model id rather
+            // than on the setting alone.
+            ...(effort !== "off" && reasoningModel(model)
+              ? { reasoning_effort: effort === "deep" ? "high" : "medium" }
+              : {}),
+          },
+          { signal },
+        );
+      } catch (error) {
+        throw describe(error, label, provider === "custom");
+      }
+
+      let text = "";
+      let refusal = "";
+      let finishReason: string | null | undefined;
+
+      // Tool calls stream in as deltas keyed by index — name arrives once, then
+      // arguments accumulate across many chunks as raw JSON text.
+      const partials = new Map<number, { id: string; name: string; args: string }>();
+
+      try {
+        for await (const chunk of stream as AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>) {
+          const choice = chunk.choices[0];
+          if (!choice) continue;
+          if (choice.finish_reason) finishReason = choice.finish_reason;
+
+          const delta = choice.delta;
+          if (delta?.content) {
+            text += delta.content;
+            onText(delta.content);
+          }
+          if (delta?.refusal) refusal += delta.refusal;
+
+          for (const call of delta?.tool_calls ?? []) {
+            const existing = partials.get(call.index) ?? { id: "", name: "", args: "" };
+            if (call.id) existing.id = call.id;
+            if (call.function?.name) existing.name = call.function.name;
+            if (call.function?.arguments) existing.args += call.function.arguments;
+            partials.set(call.index, existing);
+          }
+        }
+      } catch (error) {
+        throw describe(error, label, provider === "custom");
+      }
+
+      const toolCalls = Array.from(partials.entries())
+        .sort(([a], [b]) => a - b)
+        .filter(([, call]) => call.name)
+        .map(([index, call]) => ({
+          // Some OpenAI-compatible backends omit ids; the id only has to be
+          // unique within the turn for the tool result to match up.
+          id: call.id || `call_${index}`,
+          name: call.name,
+          input: parseArguments(call.args),
+        }));
+
+      if (refusal) {
+        return { text: refusal, toolCalls: [], stopReason: "refusal", refusal };
+      }
+
+      return {
+        text,
+        toolCalls,
+        stopReason: toStopReason(finishReason, toolCalls.length > 0),
+      };
+    },
+  };
+}
+
+/**
+ * Whatever the server actually said, dug out of the SDK's error.
+ *
+ * `error.message` is often the SDK's own summary ("Internal server error") while
+ * the useful sentence sits in the parsed body under `error.error.message`. A
+ * server that refuses a payload usually says why there, and that line is the
+ * difference between a fixable problem and a dead end.
+ */
+function serverSaid(error: InstanceType<typeof OpenAI.APIError>): string {
+  const body = error.error as { message?: string; detail?: string } | undefined;
+  const said = body?.message ?? body?.detail ?? "";
+  return said && said !== error.message ? said : error.message;
+}
+
+function describe(error: unknown, label: string, custom: boolean): Error {
+  if (error instanceof OpenAI.AuthenticationError) {
+    return new PlannerError(`${label} rejected your API key. Check it in the extension options.`);
+  }
+  if (error instanceof OpenAI.RateLimitError) {
+    return new PlannerError(`${label} rate-limited this request. Wait a moment and retry.`);
+  }
+  if (error instanceof OpenAI.NotFoundError) {
+    return new PlannerError(
+      `${label} does not recognise that model id, or your key cannot access it. ` +
+        `Pick another model in the extension options.`,
+    );
+  }
+
+  if (error instanceof OpenAI.APIError) {
+    // The status is absent when the failure arrives mid-stream rather than on
+    // the initial response, which is exactly when "API error undefined" used to
+    // be printed - a message that named the one thing nobody needed to know.
+    const status = typeof error.status === "number" ? ` ${error.status}` : "";
+
+    // A server we know nothing about rejects a payload for one of two reasons
+    // far more often than any other, and neither is obvious from a 500.
+    const hint = custom
+      ? " This usually means the model will not accept part of what was sent. " +
+        "Two things to try, in this order: turn off \u201cSend the redacted screenshot\u201d " +
+        "in options, since a text-only model rejects an image; and if that does not " +
+        "help, check the model supports tool calling \u2014 the agent cannot work without it."
+      : "";
+
+    return new PlannerError(`${label} API error${status}: ${serverSaid(error)}.${hint}`);
+  }
+
+  return error instanceof Error ? error : new Error(String(error));
+}
